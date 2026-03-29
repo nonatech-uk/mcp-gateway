@@ -2,16 +2,21 @@
 
 import logging
 import os
+from collections.abc import Awaitable, Callable
 
 import httpx
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.server import create_proxy
+from fastmcp.server.middleware import MiddlewareContext
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from mcp_gateway.auth import create_auth
 
 log = logging.getLogger(__name__)
+
+_GATEWAY_KEY = os.environ.get("MCP_GATEWAY_KEY", "")
+_unlocked_sessions: set[str] = set()
 
 # Backend MCP servers configured via env: MCP_BACKENDS=name=url,name=url,...
 # e.g. MCP_BACKENDS=tautulli=http://mcp-tautulli:8080/mcp,paperless=http://mcp-paperless:8080/mcp
@@ -23,6 +28,32 @@ _NAS_API_KEY = os.environ.get("NAS_HOST_TOOLS_API_KEY", "")
 _SSL_CA_CERTFILE = os.environ.get("SSL_CA_CERTFILE", "")
 
 
+async def gateway_key_middleware(
+    context: MiddlewareContext,
+    call_next: Callable[[MiddlewareContext], Awaitable],
+):
+    """FastMCP middleware: block tool calls from sessions that haven't unlocked."""
+    # Only gate tools/call requests
+    if context.method != "tools/call":
+        return await call_next(context)
+
+    # The message is CallToolRequestParams directly — name is on the message itself
+    tool_name = getattr(context.message, "name", "") or ""
+
+    # Always allow gateway_unlock through
+    if tool_name == "gateway_unlock":
+        return await call_next(context)
+
+    # Check session
+    ctx = context.fastmcp_context
+    sid = ctx.session_id if ctx else None
+    if not sid or sid not in _unlocked_sessions:
+        log.warning("Blocked %s — session %s not unlocked", tool_name, (sid or "?")[:8])
+        raise ValueError("Session not unlocked. Call gateway_unlock with the correct key first.")
+
+    return await call_next(context)
+
+
 def create_server() -> FastMCP:
     """Create the gateway server with remote backends mounted as proxies."""
     auth_enabled = os.environ.get("MCP_AUTH_ENABLED", "true").lower() == "true"
@@ -32,6 +63,11 @@ def create_server() -> FastMCP:
         kwargs["auth"] = create_auth()
 
     gw = FastMCP(**kwargs)
+
+    # Register gateway key middleware if key is configured
+    if _GATEWAY_KEY:
+        gw.add_middleware(gateway_key_middleware)
+        log.warning("Gateway key middleware enabled")
 
     backends = os.environ.get("MCP_BACKENDS", "")
     for entry in backends.split(","):
@@ -135,6 +171,25 @@ def create_server() -> FastMCP:
                 host: Filter by host name. Omit to see all hosts.
             """
             return await _nas_call("/api/tools/suggestions_recent", {"count": count, "host": host})
+
+    # Session unlock tool — required before any other tool call when MCP_GATEWAY_KEY is set
+    if _GATEWAY_KEY:
+        @gw.tool(name="gateway_unlock")
+        async def gateway_unlock(key: str, ctx: Context) -> str:
+            """Unlock this session to allow tool calls. Must be called before using any other tool.
+
+            Args:
+                key: The gateway access key.
+            """
+            if key != _GATEWAY_KEY:
+                log.warning("gateway_unlock failed — wrong key")
+                return "ERROR: Invalid key."
+            sid = ctx.session_id
+            if not sid:
+                return "ERROR: No session ID found."
+            _unlocked_sessions.add(sid)
+            log.info("Session %s unlocked", sid[:8])
+            return "Session unlocked. You may now use all tools."
 
     @gw.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> JSONResponse:
