@@ -19,6 +19,8 @@ log = logging.getLogger(__name__)
 # The NAS host-tools backend is registered as direct tools (not a proxy)
 # to avoid lazy-loading issues where tools aren't available at connection time.
 NAS_HOST_TOOLS_URL = os.environ.get("NAS_HOST_TOOLS_URL", "")
+_NAS_API_KEY = os.environ.get("NAS_HOST_TOOLS_API_KEY", "")
+_SSL_CA_CERTFILE = os.environ.get("SSL_CA_CERTFILE", "")
 
 
 def create_server() -> FastMCP:
@@ -46,11 +48,17 @@ def create_server() -> FastMCP:
 
         async def _nas_call(endpoint: str, body: dict | None = None) -> str:
             try:
-                async with httpx.AsyncClient(timeout=60) as client:
+                ckw: dict = {"timeout": 60}
+                if _SSL_CA_CERTFILE:
+                    ckw["verify"] = _SSL_CA_CERTFILE
+                headers = {}
+                if _NAS_API_KEY:
+                    headers["Authorization"] = f"Bearer {_NAS_API_KEY}"
+                async with httpx.AsyncClient(**ckw) as client:
                     if body is not None:
-                        resp = await client.post(f"{_nas_url}{endpoint}", json=body)
+                        resp = await client.post(f"{_nas_url}{endpoint}", json=body, headers=headers)
                     else:
-                        resp = await client.get(f"{_nas_url}{endpoint}")
+                        resp = await client.get(f"{_nas_url}{endpoint}", headers=headers)
                     resp.raise_for_status()
                     data = resp.json()
                     return data.get("output", data.get("result", str(data)))
