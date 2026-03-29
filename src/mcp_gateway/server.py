@@ -109,6 +109,25 @@ def create_server() -> FastMCP:
                 "command": command, "reason": reason, "params": params, "host": host,
             })
 
+        @gw.tool(name="suggestions_pending")
+        async def suggestions_pending(host: str | None = None) -> str:
+            """Show pending command suggestions awaiting approval. Check this before suggesting to avoid duplicates.
+
+            Args:
+                host: Filter by host name. Omit to see all hosts.
+            """
+            return await _nas_call("/api/tools/suggestions_pending", {"host": host})
+
+        @gw.tool(name="suggestions_recent")
+        async def suggestions_recent(count: int = 10, host: str | None = None) -> str:
+            """Show recently approved/rejected suggestions. Use to confirm a suggestion landed correctly.
+
+            Args:
+                count: Number of recent items to show (default 10)
+                host: Filter by host name. Omit to see all hosts.
+            """
+            return await _nas_call("/api/tools/suggestions_recent", {"count": count, "host": host})
+
     @gw.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> JSONResponse:
         tools = await gw.list_tools()
