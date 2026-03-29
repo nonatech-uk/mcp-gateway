@@ -88,16 +88,23 @@ def create_server() -> FastMCP:
 
         @gw.tool(name="host_suggest")
         async def host_suggest(
-            command: str, reason: str, params: dict | None = None, host: str | None = None,
+            command: str,
+            reason: str,
+            suggested_name: str | None = None,
+            params: dict | None = None,
+            host: str | None = None,
         ) -> str:
             """Suggest a new command to add to the allowlist for admin review.
 
             Args:
                 command: The full command template (e.g. 'smartctl -a /dev/{device}')
                 reason: Why this command would be useful for investigation
+                suggested_name: Proposed command name following {resource}_{action} convention (e.g. 'disk_containers')
                 params: Optional parameter definitions for templatizing
                 host: Which host this command is for. Defaults to the local host.
             """
+            if suggested_name:
+                reason = f"Suggested name: {suggested_name} | {reason}"
             return await _nas_call("/api/tools/suggest_command", {
                 "command": command, "reason": reason, "params": params, "host": host,
             })
