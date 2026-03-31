@@ -9,13 +9,11 @@ Consumed by Claude via `query.mees.st`.
 
 ```
 Claude ──► Authelia OAuth2 ──► mcp-gateway ──┬── MCP_BACKENDS (SSE proxies)
-                                             ├── NAS host-tools (direct, HTTPS + Bearer)
-                                             └── Mac MCP (direct, HTTPS + Bearer)
+                                             └── NAS host-tools (direct, HTTPS + Bearer)
 ```
 
-- **MCP_BACKENDS** — generic MCP servers proxied via `fastmcp.create_proxy` (SSE)
+- **MCP_BACKENDS** — generic MCP servers proxied via `fastmcp.create_proxy` (SSE). Includes Mac MCP servers reachable over WireGuard.
 - **NAS host-tools** — hand-wired direct tools with TLS + Bearer auth
-- **Mac MCP** — auto-discovered Apple tools with TLS + Bearer auth + priority routing
 
 ## Environment variables
 
@@ -50,22 +48,7 @@ Claude ──► Authelia OAuth2 ──► mcp-gateway ──┬── MCP_BACKE
 |---|---|---|
 | `NAS_HOST_TOOLS_URL` | — | Base URL, e.g. `https://10.10.0.1:8092/api` |
 | `NAS_HOST_TOOLS_API_KEY` | — | Bearer token for NAS auth |
-| `SSL_CA_CERTFILE` | — | CA certificate for verifying internal TLS (shared by NAS + Mac backends) |
-
-### Mac MCP backends
-
-| Variable | Default | Description |
-|---|---|---|
-| `MAC_MCP_BACKENDS` | — | Comma-separated `name=url` pairs, e.g. `mac-studio=https://10.10.0.3:3456,mac-notebook=https://10.10.0.4:3456` |
-| `MAC_MCP_API_KEY` | — | Shared Bearer token for Mac MCP auth |
-
-At startup the gateway calls `GET /tools` on the first reachable Mac backend to
-discover all available tools (Reminders, Calendar, Contacts, Messages, Notes,
-Shell, Clipboard, Notifications, System, Spotify, Plex, Browser). At call time
-it probes `GET /health` on all backends and routes to the highest-priority
-reachable host (Studio=10, Notebook=5).
-
-Both Mac and NAS backends verify TLS using `SSL_CA_CERTFILE`.
+| `SSL_CA_CERTFILE` | — | CA certificate for verifying internal TLS |
 
 ## Build & run
 
