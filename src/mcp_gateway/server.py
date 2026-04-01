@@ -2,10 +2,12 @@
 
 import logging
 import os
+import ssl
 from collections.abc import Awaitable, Callable
 
 import httpx
 from fastmcp import Context, FastMCP
+from fastmcp.client.transports.http import StreamableHttpTransport
 from fastmcp.server import create_proxy
 from fastmcp.server.middleware import MiddlewareContext
 from starlette.requests import Request
@@ -26,6 +28,9 @@ _unlocked_sessions: set[str] = set()
 NAS_HOST_TOOLS_URL = os.environ.get("NAS_HOST_TOOLS_URL", "")
 _NAS_API_KEY = os.environ.get("NAS_HOST_TOOLS_API_KEY", "")
 _SSL_CA_CERTFILE = os.environ.get("SSL_CA_CERTFILE", "")
+
+_MAC_API_KEY = os.environ.get("MAC_MCP_API_KEY", "")
+_MAC_CA_CERTFILE = os.environ.get("MAC_MCP_CA_CERTFILE", "")
 
 
 async def gateway_key_middleware(
@@ -76,6 +81,39 @@ def create_server() -> FastMCP:
             continue
         name, url = entry.split("=", 1)
         proxy = create_proxy(url.strip(), name=name.strip())
+        gw.mount(proxy)
+
+    # MAC backends: TLS with custom CA + API key auth
+    if _MAC_CA_CERTFILE:
+        _mac_ssl_ctx = ssl.create_default_context(cafile=_MAC_CA_CERTFILE)
+
+    mac_backends = os.environ.get("MAC_MCP_BACKENDS", "")
+    for entry in mac_backends.split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        name, url = entry.split("=", 1)
+        url = url.strip()
+        if not url.endswith("/mcp"):
+            url += "/mcp"
+
+        def _mac_httpx_factory(
+            headers=None, timeout=None, auth=None, **kwargs,
+        ):
+            return httpx.AsyncClient(
+                verify=_mac_ssl_ctx if _MAC_CA_CERTFILE else True,
+                headers=headers or {},
+                timeout=timeout or httpx.Timeout(30.0, read=300.0),
+                auth=auth,
+                follow_redirects=True,
+            )
+
+        transport = StreamableHttpTransport(
+            url=url,
+            auth=_MAC_API_KEY or None,
+            httpx_client_factory=_mac_httpx_factory,
+        )
+        proxy = create_proxy(transport, name=name.strip())
         gw.mount(proxy)
 
     # Register NAS host-tools as direct tools (not proxy) for immediate availability
