@@ -1,4 +1,4 @@
-"""MCP gateway — proxies to backend MCP servers over HTTP with OAuth2 auth."""
+"""MCP gateway — proxies to backend MCP servers over HTTP."""
 
 import logging
 import os
@@ -10,14 +10,33 @@ from fastmcp import Context, FastMCP
 from fastmcp.client.transports.http import StreamableHttpTransport
 from fastmcp.server import create_proxy
 from fastmcp.server.middleware import MiddlewareContext
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
-
-from mcp_gateway.auth import create_auth
+from starlette.responses import JSONResponse, Response
 
 log = logging.getLogger(__name__)
 
 _GATEWAY_KEY = os.environ.get("MCP_GATEWAY_KEY", "")
+_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
+
+
+class BearerTokenMiddleware(BaseHTTPMiddleware):
+    """Reject requests without a valid token in query param or Authorization header. Returns bare 403."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/health":
+            return await call_next(request)
+        if not _BEARER_TOKEN:
+            return await call_next(request)
+        # Check query param first, then Authorization header
+        token = request.query_params.get("token", "")
+        if not token:
+            auth = request.headers.get("authorization", "")
+            if auth.startswith("Bearer "):
+                token = auth[7:]
+        if token != _BEARER_TOKEN:
+            return Response(status_code=403)
+        return await call_next(request)
 _unlocked_sessions: set[str] = set()
 
 # Backend MCP servers configured via env: MCP_BACKENDS=name=url,name=url,...
@@ -61,18 +80,24 @@ async def gateway_key_middleware(
 
 def create_server() -> FastMCP:
     """Create the gateway server with remote backends mounted as proxies."""
-    auth_enabled = os.environ.get("MCP_AUTH_ENABLED", "true").lower() == "true"
+    gw = FastMCP(name="mcp-gateway")
 
-    kwargs: dict = {"name": "mcp-gateway"}
-    if auth_enabled:
-        kwargs["auth"] = create_auth()
-
-    gw = FastMCP(**kwargs)
+    # Bearer token auth at HTTP level — returns bare 403, hides MCP identity
+    if _BEARER_TOKEN:
+        log.warning("Bearer token middleware enabled")
 
     # Register gateway key middleware if key is configured
     if _GATEWAY_KEY:
         gw.add_middleware(gateway_key_middleware)
         log.warning("Gateway key middleware enabled")
+
+    def _backend_httpx_factory(headers=None, timeout=None, auth=None, **kwargs):
+        return httpx.AsyncClient(
+            headers=headers or {},
+            timeout=httpx.Timeout(10.0, read=30.0),
+            auth=auth,
+            follow_redirects=True,
+        )
 
     backends = os.environ.get("MCP_BACKENDS", "")
     for entry in backends.split(","):
@@ -80,7 +105,11 @@ def create_server() -> FastMCP:
         if not entry or "=" not in entry:
             continue
         name, url = entry.split("=", 1)
-        proxy = create_proxy(url.strip(), name=name.strip())
+        transport = StreamableHttpTransport(
+            url=url.strip(),
+            httpx_client_factory=_backend_httpx_factory,
+        )
+        proxy = create_proxy(transport, name=name.strip())
         gw.mount(proxy)
 
     # MAC backends: TLS with custom CA + API key auth
@@ -103,7 +132,7 @@ def create_server() -> FastMCP:
             return httpx.AsyncClient(
                 verify=_mac_ssl_ctx if _MAC_CA_CERTFILE else True,
                 headers=headers or {},
-                timeout=timeout or httpx.Timeout(30.0, read=300.0),
+                timeout=timeout or httpx.Timeout(10.0, read=30.0),
                 auth=auth,
                 follow_redirects=True,
             )
@@ -249,4 +278,10 @@ if __name__ == "__main__":
     else:
         host = os.environ.get("MCP_HOST", "0.0.0.0")
         port = int(os.environ.get("MCP_PORT", "8080"))
-        gateway.run(transport="streamable-http", host=host, port=port)
+        if _BEARER_TOKEN:
+            app = gateway.http_app()
+            app.add_middleware(BearerTokenMiddleware)
+            import uvicorn
+            uvicorn.run(app, host=host, port=port)
+        else:
+            gateway.run(transport="streamable-http", host=host, port=port)
