@@ -3,7 +3,6 @@
 import logging
 import os
 import ssl
-import time
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -19,152 +18,25 @@ log = logging.getLogger(__name__)
 
 _GATEWAY_KEY = os.environ.get("MCP_GATEWAY_KEY", "")
 _BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
-_HYDRA_ADMIN_URL = os.environ.get("HYDRA_ADMIN_URL", "").rstrip("/")
-_HYDRA_INTROSPECTION_AUDIENCE = os.environ.get("HYDRA_INTROSPECTION_AUDIENCE", "")
-_HYDRA_INTROSPECTION_SCOPE = os.environ.get("HYDRA_INTROSPECTION_SCOPE", "")
-_MCP_RESOURCE_URL = os.environ.get("MCP_RESOURCE_URL", "")
-_CORS_ALLOWED_ORIGINS = {
-    o.strip() for o in os.environ.get(
-        "MCP_CORS_ALLOWED_ORIGINS",
-        "https://claude.ai,https://www.claude.ai",
-    ).split(",") if o.strip()
-}
-
-
-def _www_authenticate_header(error: str) -> str:
-    """Build RFC 6750 + RFC 9728 WWW-Authenticate header so MCP clients know to
-    discover the authorization server and start the OAuth flow."""
-    parts = ['Bearer realm="mcp"', f'error="{error}"']
-    if _MCP_RESOURCE_URL:
-        # Strip path; the metadata is served at the resource's origin.
-        from urllib.parse import urlparse
-        u = urlparse(_MCP_RESOURCE_URL)
-        parts.append(f'resource_metadata="{u.scheme}://{u.netloc}/.well-known/oauth-protected-resource"')
-    return ", ".join(parts)
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
-    """Token auth. Order: static MCP_BEARER_TOKEN first (Claude Code CLI path),
-    then Hydra introspection (claude.ai / Desktop path). Returns bare 403.
-    Introspection results are cached for 60s to avoid hammering Hydra."""
-
-    # token → (expires_at_epoch, accepted_bool)
-    _introspect_cache: dict[str, tuple[float, bool]] = {}
-    _cache_ttl = 60.0
+    """Reject requests without a valid token in query param or Authorization header. Returns bare 403."""
 
     async def dispatch(self, request: Request, call_next):
-        p = request.url.path
-        origin = request.headers.get("origin", "")
-        cors_ok = bool(origin) and (origin in _CORS_ALLOWED_ORIGINS or _CORS_ALLOWED_ORIGINS == {"*"})
-
-        # Handle CORS preflight directly — browsers send this before any
-        # cross-origin request with non-simple headers (Authorization, etc).
-        if request.method == "OPTIONS":
-            headers = {
-                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version",
-                "Access-Control-Max-Age": "600",
-            }
-            if cors_ok:
-                headers["Access-Control-Allow-Origin"] = origin
-                headers["Access-Control-Allow-Credentials"] = "true"
-                headers["Vary"] = "Origin"
-            return Response(status_code=204, headers=headers)
-
-        # /health + any OAuth discovery endpoint are always public.
-        if p == "/health" or p.startswith("/.well-known/"):
-            resp = await call_next(request)
-            if cors_ok:
-                resp.headers["Access-Control-Allow-Origin"] = origin
-                resp.headers["Access-Control-Allow-Credentials"] = "true"
-                resp.headers.setdefault("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id")
-                resp.headers["Vary"] = "Origin"
-            return resp
-        if not _BEARER_TOKEN and not _HYDRA_ADMIN_URL:
+        if request.url.path == "/health":
             return await call_next(request)
-        # Query param first, then Authorization header.
+        if not _BEARER_TOKEN:
+            return await call_next(request)
+        # Check query param first, then Authorization header
         token = request.query_params.get("token", "")
         if not token:
             auth = request.headers.get("authorization", "")
             if auth.startswith("Bearer "):
                 token = auth[7:]
-        if not token:
-            return self._unauthorized(request, "missing_token")
-        # Static bearer (CLI) path.
-        if _BEARER_TOKEN and token == _BEARER_TOKEN:
-            resp = await call_next(request)
-            self._apply_cors(resp, origin, cors_ok)
-            return resp
-        # Hydra introspection path.
-        if _HYDRA_ADMIN_URL and await self._introspect_ok(token):
-            resp = await call_next(request)
-            self._apply_cors(resp, origin, cors_ok)
-            return resp
-        return self._unauthorized(request, "invalid_token")
-
-    @staticmethod
-    def _apply_cors(resp: Response, origin: str, cors_ok: bool) -> None:
-        if cors_ok:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers.setdefault("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id")
-            resp.headers["Vary"] = "Origin"
-
-    def _unauthorized(self, request: Request, error: str) -> Response:
-        # 401 + WWW-Authenticate tells MCP clients to discover the AS and start
-        # the OAuth flow (RFC 6750 / RFC 9728). Bare 403 is interpreted as
-        # "authenticated but forbidden" and clients don't retry.
-        # Browser MCP clients (claude.ai web) can only read WWW-Authenticate if
-        # it's in Access-Control-Expose-Headers — otherwise the CORS layer hides
-        # custom headers from JS.
-        origin = request.headers.get("origin", "")
-        allow_origin = origin if origin in _CORS_ALLOWED_ORIGINS or _CORS_ALLOWED_ORIGINS == {"*"} else ""
-        headers = {
-            "WWW-Authenticate": _www_authenticate_header(error),
-            "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id",
-        }
-        if allow_origin:
-            headers["Access-Control-Allow-Origin"] = allow_origin
-            headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Vary"] = "Origin"
-        body = {
-            "error": error,
-            "error_description": "Authorization required. See WWW-Authenticate header for resource metadata.",
-        }
-        return JSONResponse(body, status_code=401, headers=headers)
-
-    async def _introspect_ok(self, token: str) -> bool:
-        now = time.monotonic()
-        cached = self._introspect_cache.get(token)
-        if cached and cached[0] > now:
-            return cached[1]
-        try:
-            async with httpx.AsyncClient(timeout=5) as c:
-                data = {"token": token}
-                if _HYDRA_INTROSPECTION_SCOPE:
-                    data["scope"] = _HYDRA_INTROSPECTION_SCOPE
-                r = await c.post(
-                    f"{_HYDRA_ADMIN_URL}/admin/oauth2/introspect",
-                    data=data,
-                    headers={"Accept": "application/json"},
-                )
-                r.raise_for_status()
-                body = r.json()
-                ok = bool(body.get("active"))
-                if ok and _HYDRA_INTROSPECTION_AUDIENCE:
-                    aud = body.get("aud") or []
-                    if _HYDRA_INTROSPECTION_AUDIENCE not in aud:
-                        ok = False
-        except Exception as e:
-            log.warning("Hydra introspection failed: %s", e)
-            ok = False
-        self._introspect_cache[token] = (now + self._cache_ttl, ok)
-        # Opportunistic cache trim.
-        if len(self._introspect_cache) > 1024:
-            for k, (exp, _) in list(self._introspect_cache.items()):
-                if exp <= now:
-                    self._introspect_cache.pop(k, None)
-        return ok
+        if token != _BEARER_TOKEN:
+            return Response(status_code=403)
+        return await call_next(request)
 _unlocked_sessions: set[str] = set()
 
 # Backend MCP servers configured via env: MCP_BACKENDS=name=url,name=url,...
@@ -393,31 +265,6 @@ def create_server() -> FastMCP:
             "status": "ok",
             "tools": len(tools),
         })
-
-    # RFC 9728 — OAuth Protected Resource metadata. Points MCP clients
-    # (claude.ai / Desktop) at Hydra as the authorization server.
-    _RESOURCE_URL = os.environ.get("MCP_RESOURCE_URL", "")
-    _AS_URL = os.environ.get("MCP_AUTHORIZATION_SERVER", "")
-
-    if _RESOURCE_URL and _AS_URL:
-        # RFC 9728 allows both the root path and a resource-specific path.
-        # claude.ai tries the resource-specific one first (e.g.
-        # /.well-known/oauth-protected-resource/mcp), then falls back to the
-        # root. Serve the same payload at both.
-        _metadata = {
-            "resource": _RESOURCE_URL,
-            "authorization_servers": [_AS_URL],
-            "bearer_methods_supported": ["header", "query"],
-            "scopes_supported": ["mcp"],
-        }
-
-        @gw.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
-        async def oauth_protected_resource(request: Request) -> JSONResponse:
-            return JSONResponse(_metadata)
-
-        @gw.custom_route("/.well-known/oauth-protected-resource/mcp", methods=["GET"])
-        async def oauth_protected_resource_mcp(request: Request) -> JSONResponse:
-            return JSONResponse(_metadata)
 
     return gw
 
