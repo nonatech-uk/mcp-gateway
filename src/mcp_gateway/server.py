@@ -278,10 +278,14 @@ if __name__ == "__main__":
     else:
         host = os.environ.get("MCP_HOST", "0.0.0.0")
         port = int(os.environ.get("MCP_PORT", "8080"))
+        # MCP_JSON_RESPONSE=1 closes POST streams after the response body instead
+        # of keeping SSE open. Needed when fronted by Cloudflare Tunnel, which
+        # handles the held-open SSE pattern poorly compared to CF proxy-to-origin.
+        json_response = os.environ.get("MCP_JSON_RESPONSE", "").lower() in ("1", "true", "yes") or None
         if _BEARER_TOKEN:
-            app = gateway.http_app()
+            app = gateway.http_app(json_response=json_response)
             app.add_middleware(BearerTokenMiddleware)
             import uvicorn
             uvicorn.run(app, host=host, port=port)
         else:
-            gateway.run(transport="streamable-http", host=host, port=port)
+            gateway.run(transport="streamable-http", host=host, port=port, json_response=json_response)

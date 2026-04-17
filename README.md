@@ -1,19 +1,27 @@
 # mcp-gateway
 
-MCP gateway that proxies to backend MCP servers over HTTP, with OAuth2
-authentication via Authelia and session-level access control.
+MCP gateway that proxies to backend MCP servers over HTTP. Authentication is
+a URL-embedded bearer token, layered with an IP allowlist enforced by Traefik.
 
 Consumed by Claude via `query.mees.st`.
 
 ## Architecture
 
 ```
-Claude ──► Authelia OAuth2 ──► mcp-gateway ──┬── MCP_BACKENDS (SSE proxies)
-                                             └── NAS host-tools (direct, HTTPS + Bearer)
+Claude ──► Cloudflare ──► Traefik (IP allowlist: Anthropic + LAN/loopback)
+                           │
+                           └► mcp-gateway (bearer-token middleware) ──┬── MCP_BACKENDS (streamable-http proxies)
+                                                                     ├── MAC_MCP_BACKENDS (TLS + API key)
+                                                                     └── NAS host-tools (direct, HTTPS + Bearer)
 ```
 
-- **MCP_BACKENDS** — generic MCP servers proxied via `fastmcp.create_proxy` (SSE). Includes Mac MCP servers reachable over WireGuard.
-- **NAS host-tools** — hand-wired direct tools with TLS + Bearer auth
+- **Bearer token** — required on every request as `?token=…` query param or `Authorization: Bearer …` header. Missing/wrong token → bare `403`.
+- **IP allowlist** (`anthropic-only` middleware in Traefik) — restricts `/mcp` path to Anthropic's ranges, NAS WAN IP, and RFC1918/loopback for internal testing. Non-`/mcp` paths are served by the gateway directly (still token-gated).
+- **MCP_BACKENDS** — generic MCP servers proxied via `fastmcp.create_proxy` (streamable-http).
+- **MAC_MCP_BACKENDS** — Mac MCP servers over WireGuard with custom CA + API key.
+- **NAS host-tools** — hand-wired direct tools with TLS + Bearer auth.
+
+> `src/mcp_gateway/auth.py` contains legacy Authelia OIDC introspection code and is currently unused — the initial design delegated to Authelia but that path was dropped in favour of the simpler token+IP approach.
 
 ## Environment variables
 
@@ -29,12 +37,8 @@ Claude ──► Authelia OAuth2 ──► mcp-gateway ──┬── MCP_BACKE
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_AUTH_ENABLED` | `true` | Enable OAuth2 via Authelia |
-| `AUTHELIA_URL` | — | Authelia base URL (required if auth enabled) |
-| `OIDC_CLIENT_ID` | — | OAuth2 client ID |
-| `OIDC_CLIENT_SECRET` | — | OAuth2 client secret |
-| `MCP_BASE_URL` | `https://query.mees.st` | OAuth redirect base URL |
-| `MCP_GATEWAY_KEY` | — | Session unlock key (if set, all tool calls blocked until `gateway_unlock` called) |
+| `MCP_BEARER_TOKEN` | — | If set, all requests (except `/health`) must present this token as `?token=…` or `Authorization: Bearer …`. Missing/wrong → bare 403. |
+| `MCP_GATEWAY_KEY` | — | Session unlock key. If set, tool calls are blocked until `gateway_unlock` is called with this key. |
 
 ### Generic MCP backends
 
