@@ -3,6 +3,7 @@
 import logging
 import os
 import ssl
+import time
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -20,6 +21,12 @@ _GATEWAY_KEY = os.environ.get("MCP_GATEWAY_KEY", "")
 _BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
 _MCP_RESOURCE_URL = os.environ.get("MCP_RESOURCE_URL", "")
 _MCP_AUTHORIZATION_SERVER = os.environ.get("MCP_AUTHORIZATION_SERVER", "")
+# OAuth introspection (RFC 7662) for Keycloak-issued bearer tokens.
+_INTROSPECTION_URL = os.environ.get("MCP_INTROSPECTION_URL", "")
+_INTROSPECTION_CLIENT_ID = os.environ.get("MCP_INTROSPECTION_CLIENT_ID", "")
+_INTROSPECTION_CLIENT_SECRET = os.environ.get("MCP_INTROSPECTION_CLIENT_SECRET", "")
+_INTROSPECTION_REQUIRED_SCOPE = os.environ.get("MCP_INTROSPECTION_REQUIRED_SCOPE", "mcp")
+_INTROSPECTION_REQUIRED_AUD = os.environ.get("MCP_INTROSPECTION_REQUIRED_AUD", "")
 _CORS_ALLOWED_ORIGINS = {
     o.strip() for o in os.environ.get(
         "MCP_CORS_ALLOWED_ORIGINS",
@@ -39,9 +46,19 @@ def _resource_metadata_url() -> str:
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
-    """Bearer token auth. Returns 401 with WWW-Authenticate on failure so MCP
-    clients discover the authorization server and start OAuth. Preserves CORS
-    for browser clients (claude.ai web)."""
+    """Bearer token auth. Accepts either:
+      1. The static MCP_BEARER_TOKEN (Claude Code CLI path, URL ?token= or
+         Authorization header). Unchanged from pre-OAuth behaviour.
+      2. An opaque OAuth bearer token validated via RFC 7662 introspection
+         against Keycloak (claude.ai web/Desktop path). Requires active=true
+         plus the configured required scope and audience.
+
+    Returns 401 with WWW-Authenticate on failure so MCP clients discover the
+    authorization server and start OAuth. Preserves CORS for browser clients."""
+
+    # token → (expires_at, accepted_bool)
+    _introspect_cache: dict[str, tuple[float, bool]] = {}
+    _cache_ttl = 60.0
 
     async def dispatch(self, request: Request, call_next):
         p = request.url.path
@@ -68,7 +85,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             self._apply_cors(resp, origin, cors_ok)
             return resp
 
-        if not _BEARER_TOKEN:
+        if not _BEARER_TOKEN and not _INTROSPECTION_URL:
             return await call_next(request)
 
         # Query param first, then Authorization header.
@@ -78,12 +95,69 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             if auth.startswith("Bearer "):
                 token = auth[7:]
 
-        if token != _BEARER_TOKEN:
+        if not token:
             return self._unauthorized(origin, cors_ok)
 
-        resp = await call_next(request)
-        self._apply_cors(resp, origin, cors_ok)
-        return resp
+        # Static token fast path (Claude Code CLI). No introspection round-trip.
+        if _BEARER_TOKEN and token == _BEARER_TOKEN:
+            resp = await call_next(request)
+            self._apply_cors(resp, origin, cors_ok)
+            return resp
+
+        # OAuth bearer path.
+        if _INTROSPECTION_URL and await self._introspect_ok(token):
+            resp = await call_next(request)
+            self._apply_cors(resp, origin, cors_ok)
+            return resp
+
+        return self._unauthorized(origin, cors_ok)
+
+    async def _introspect_ok(self, token: str) -> bool:
+        now = time.monotonic()
+        cached = self._introspect_cache.get(token)
+        if cached and cached[0] > now:
+            return cached[1]
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.post(
+                    _INTROSPECTION_URL,
+                    auth=(_INTROSPECTION_CLIENT_ID, _INTROSPECTION_CLIENT_SECRET),
+                    data={"token": token},
+                    headers={"Accept": "application/json"},
+                )
+                r.raise_for_status()
+                body = r.json()
+        except Exception as e:
+            log.warning("Introspection failed: %s", e)
+            self._introspect_cache[token] = (now + self._cache_ttl, False)
+            return False
+
+        if not body.get("active"):
+            self._introspect_cache[token] = (now + self._cache_ttl, False)
+            return False
+        # Required scope (space-separated string in RFC 7662).
+        if _INTROSPECTION_REQUIRED_SCOPE:
+            scopes = (body.get("scope") or "").split()
+            if _INTROSPECTION_REQUIRED_SCOPE not in scopes:
+                log.info("Token rejected: missing required scope %r", _INTROSPECTION_REQUIRED_SCOPE)
+                self._introspect_cache[token] = (now + self._cache_ttl, False)
+                return False
+        # Required audience (string or list per RFC 7662).
+        if _INTROSPECTION_REQUIRED_AUD:
+            aud = body.get("aud")
+            aud_list = aud if isinstance(aud, list) else ([aud] if aud else [])
+            if _INTROSPECTION_REQUIRED_AUD not in aud_list:
+                log.info("Token rejected: aud %r does not include %r", aud, _INTROSPECTION_REQUIRED_AUD)
+                self._introspect_cache[token] = (now + self._cache_ttl, False)
+                return False
+
+        self._introspect_cache[token] = (now + self._cache_ttl, True)
+        # Opportunistic cache trim.
+        if len(self._introspect_cache) > 1024:
+            for k, (exp, _) in list(self._introspect_cache.items()):
+                if exp <= now:
+                    self._introspect_cache.pop(k, None)
+        return True
 
     def _unauthorized(self, origin: str, cors_ok: bool) -> Response:
         # Minimal WWW-Authenticate — Anthropic's MCP client expects
@@ -349,8 +423,8 @@ def create_server() -> FastMCP:
         _resource_metadata = {
             "resource": _MCP_RESOURCE_URL,
             "authorization_servers": [_MCP_AUTHORIZATION_SERVER],
-            "bearer_methods_supported": ["header", "query"],
-            "scopes_supported": ["mcp"],
+            "scopes_supported": ["mcp", "offline_access"],
+            "bearer_methods_supported": ["header"],
         }
 
         @gw.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
