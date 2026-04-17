@@ -18,25 +18,101 @@ log = logging.getLogger(__name__)
 
 _GATEWAY_KEY = os.environ.get("MCP_GATEWAY_KEY", "")
 _BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
+_MCP_RESOURCE_URL = os.environ.get("MCP_RESOURCE_URL", "")
+_MCP_AUTHORIZATION_SERVER = os.environ.get("MCP_AUTHORIZATION_SERVER", "")
+_CORS_ALLOWED_ORIGINS = {
+    o.strip() for o in os.environ.get(
+        "MCP_CORS_ALLOWED_ORIGINS",
+        "https://claude.ai,https://www.claude.ai",
+    ).split(",") if o.strip()
+}
+
+
+def _resource_metadata_url() -> str:
+    """Absolute URL to the resource metadata endpoint. Anthropic's MCP client
+    silently rejects relative values; the URL MUST be absolute."""
+    if not _MCP_RESOURCE_URL:
+        return ""
+    from urllib.parse import urlparse
+    u = urlparse(_MCP_RESOURCE_URL)
+    return f"{u.scheme}://{u.netloc}/.well-known/oauth-protected-resource"
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
-    """Reject requests without a valid token in query param or Authorization header. Returns bare 403."""
+    """Bearer token auth. Returns 401 with WWW-Authenticate on failure so MCP
+    clients discover the authorization server and start OAuth. Preserves CORS
+    for browser clients (claude.ai web)."""
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
-            return await call_next(request)
+        p = request.url.path
+        origin = request.headers.get("origin", "")
+        cors_ok = bool(origin) and (origin in _CORS_ALLOWED_ORIGINS or _CORS_ALLOWED_ORIGINS == {"*"})
+
+        # CORS preflight — browser sends before any cross-origin request carrying
+        # non-simple headers (Authorization, Content-Type: application/json, …).
+        if request.method == "OPTIONS":
+            headers = {
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version",
+                "Access-Control-Max-Age": "600",
+            }
+            if cors_ok:
+                headers["Access-Control-Allow-Origin"] = origin
+                headers["Access-Control-Allow-Credentials"] = "true"
+                headers["Vary"] = "Origin"
+            return Response(status_code=204, headers=headers)
+
+        # /health + /.well-known/* are always public.
+        if p == "/health" or p.startswith("/.well-known/"):
+            resp = await call_next(request)
+            self._apply_cors(resp, origin, cors_ok)
+            return resp
+
         if not _BEARER_TOKEN:
             return await call_next(request)
-        # Check query param first, then Authorization header
+
+        # Query param first, then Authorization header.
         token = request.query_params.get("token", "")
         if not token:
             auth = request.headers.get("authorization", "")
             if auth.startswith("Bearer "):
                 token = auth[7:]
+
         if token != _BEARER_TOKEN:
-            return Response(status_code=403)
-        return await call_next(request)
+            return self._unauthorized(origin, cors_ok)
+
+        resp = await call_next(request)
+        self._apply_cors(resp, origin, cors_ok)
+        return resp
+
+    def _unauthorized(self, origin: str, cors_ok: bool) -> Response:
+        # Minimal WWW-Authenticate — Anthropic's MCP client expects
+        # `Bearer realm="MCP", resource_metadata="<absolute-url>"` exactly.
+        # Extra params (error, error_description) are dropped to minimise the
+        # surface their parser can trip on.
+        rm = _resource_metadata_url()
+        parts = ['Bearer realm="MCP"']
+        if rm:
+            parts.append(f'resource_metadata="{rm}"')
+        headers = {
+            "WWW-Authenticate": ", ".join(parts),
+            # Browser JS can only read WWW-Authenticate when it's in
+            # Access-Control-Expose-Headers; otherwise the CORS layer hides it.
+            "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id",
+        }
+        if cors_ok:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Access-Control-Allow-Credentials"] = "true"
+            headers["Vary"] = "Origin"
+        return Response(status_code=401, headers=headers)
+
+    @staticmethod
+    def _apply_cors(resp: Response, origin: str, cors_ok: bool) -> None:
+        if cors_ok:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers.setdefault("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id")
+            resp.headers["Vary"] = "Origin"
 _unlocked_sessions: set[str] = set()
 
 # Backend MCP servers configured via env: MCP_BACKENDS=name=url,name=url,...
@@ -265,6 +341,25 @@ def create_server() -> FastMCP:
             "status": "ok",
             "tools": len(tools),
         })
+
+    # RFC 9728 protected-resource metadata. Tells MCP clients which authorization
+    # server to use. Served at both the root and resource-specific paths
+    # (some clients check /.well-known/oauth-protected-resource/<path>).
+    if _MCP_RESOURCE_URL and _MCP_AUTHORIZATION_SERVER:
+        _resource_metadata = {
+            "resource": _MCP_RESOURCE_URL,
+            "authorization_servers": [_MCP_AUTHORIZATION_SERVER],
+            "bearer_methods_supported": ["header", "query"],
+            "scopes_supported": ["mcp"],
+        }
+
+        @gw.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+        async def opr_root(request: Request) -> JSONResponse:
+            return JSONResponse(_resource_metadata)
+
+        @gw.custom_route("/.well-known/oauth-protected-resource/mcp", methods=["GET"])
+        async def opr_mcp(request: Request) -> JSONResponse:
+            return JSONResponse(_resource_metadata)
 
     return gw
 
