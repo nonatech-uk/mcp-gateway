@@ -5,6 +5,7 @@ import os
 import ssl
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 
 import httpx
 from fastmcp import Context, FastMCP
@@ -15,10 +16,26 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from .tokens import (
+    TokenPolicy,
+    ip_allowed,
+    load_policies,
+    match_token,
+    tool_allowed,
+)
+
 log = logging.getLogger(__name__)
 
 _GATEWAY_KEY = os.environ.get("MCP_GATEWAY_KEY", "")
-_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
+_TOKENS_FILE = os.environ.get("MCP_TOKENS_FILE", "/etc/mcp-gateway/tokens.yaml")
+_POLICIES: list[TokenPolicy] = (
+    load_policies(_TOKENS_FILE) if os.path.exists(_TOKENS_FILE) else []
+)
+# Ferries the matched policy from the Starlette HTTP middleware down to the
+# FastMCP tool middleware within the same request task.
+_current_policy: ContextVar[TokenPolicy | None] = ContextVar(
+    "_current_policy", default=None,
+)
 _MCP_RESOURCE_URL = os.environ.get("MCP_RESOURCE_URL", "")
 _MCP_AUTHORIZATION_SERVER = os.environ.get("MCP_AUTHORIZATION_SERVER", "")
 # OAuth introspection (RFC 7662) for Keycloak-issued bearer tokens.
@@ -47,11 +64,14 @@ def _resource_metadata_url() -> str:
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
     """Bearer token auth. Accepts either:
-      1. The static MCP_BEARER_TOKEN (Claude Code CLI path, URL ?token= or
-         Authorization header). Unchanged from pre-OAuth behaviour.
+      1. A static token declared in tokens.yaml (Claude Code CLI path, URL
+         ?token= or Authorization header). The matched policy's IP allowlist
+         is enforced and the policy is stashed in a ContextVar so downstream
+         FastMCP middleware can filter tools.
       2. An opaque OAuth bearer token validated via RFC 7662 introspection
          against Keycloak (claude.ai web/Desktop path). Requires active=true
-         plus the configured required scope and audience.
+         plus the configured required scope and audience. OAuth callers get
+         the full tool set — per-token filtering is for static tokens only.
 
     Returns 401 with WWW-Authenticate on failure so MCP clients discover the
     authorization server and start OAuth. Preserves CORS for browser clients."""
@@ -85,7 +105,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             self._apply_cors(resp, origin, cors_ok)
             return resp
 
-        if not _BEARER_TOKEN and not _INTROSPECTION_URL:
+        if not _POLICIES and not _INTROSPECTION_URL:
             return await call_next(request)
 
         # Query param first, then Authorization header.
@@ -98,9 +118,22 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         if not token:
             return self._unauthorized(origin, cors_ok)
 
-        # Static token fast path (Claude Code CLI). No introspection round-trip.
-        if _BEARER_TOKEN and token == _BEARER_TOKEN:
-            resp = await call_next(request)
+        # Static token path. Match against configured policies, enforce the
+        # policy's IP allowlist, then hand the policy to downstream middleware.
+        policy = match_token(_POLICIES, token) if _POLICIES else None
+        if policy is not None:
+            client_ip = _client_ip(request)
+            if not ip_allowed(policy, client_ip):
+                log.warning(
+                    "Token %r rejected — client IP %s not in allowlist",
+                    policy.name, client_ip,
+                )
+                return self._unauthorized(origin, cors_ok)
+            reset = _current_policy.set(policy)
+            try:
+                resp = await call_next(request)
+            finally:
+                _current_policy.reset(reset)
             self._apply_cors(resp, origin, cors_ok)
             return resp
 
@@ -187,6 +220,20 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers.setdefault("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id")
             resp.headers["Vary"] = "Origin"
+
+
+def _client_ip(request: Request) -> str:
+    """Real client IP. Traefik is the only HTTP hop and is trusted, so the
+    leftmost X-Forwarded-For entry is the original caller. Fall back to the
+    raw peer for the mcp-local deployment where no proxy sits in front."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        first = xff.split(",", 1)[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else ""
+
+
 _unlocked_sessions: set[str] = set()
 
 # Backend MCP servers configured via env: MCP_BACKENDS=name=url,name=url,...
@@ -228,18 +275,52 @@ async def gateway_key_middleware(
     return await call_next(context)
 
 
+async def tool_policy_middleware(
+    context: MiddlewareContext,
+    call_next: Callable[[MiddlewareContext], Awaitable],
+):
+    """FastMCP middleware: enforce per-token tool allowlist.
+
+    When the request was authenticated via a static-token policy (stashed in
+    _current_policy by the HTTP-level middleware), filter tools/list and gate
+    tools/call against the policy's glob patterns. OAuth and local no-auth
+    traffic leave _current_policy unset and pass through unchanged.
+    """
+    policy = _current_policy.get()
+    if policy is None:
+        return await call_next(context)
+
+    if context.method == "tools/list":
+        tools = await call_next(context)
+        return [t for t in tools if tool_allowed(policy, t.name)]
+
+    if context.method == "tools/call":
+        tool_name = getattr(context.message, "name", "") or ""
+        if not tool_allowed(policy, tool_name):
+            log.warning(
+                "Token %r blocked from calling tool %r", policy.name, tool_name,
+            )
+            raise ValueError(f"Tool {tool_name!r} is not permitted for this token.")
+
+    return await call_next(context)
+
+
 def create_server() -> FastMCP:
     """Create the gateway server with remote backends mounted as proxies."""
     gw = FastMCP(name="mcp-gateway")
 
     # Bearer token auth at HTTP level — returns bare 403, hides MCP identity
-    if _BEARER_TOKEN:
-        log.warning("Bearer token middleware enabled")
+    if _POLICIES:
+        log.warning("Bearer token middleware enabled (%d policies)", len(_POLICIES))
 
     # Register gateway key middleware if key is configured
     if _GATEWAY_KEY:
         gw.add_middleware(gateway_key_middleware)
         log.warning("Gateway key middleware enabled")
+
+    # Per-token tool filtering (only active when a policy matched at HTTP layer)
+    if _POLICIES:
+        gw.add_middleware(tool_policy_middleware)
 
     def _backend_httpx_factory(headers=None, timeout=None, auth=None, **kwargs):
         return httpx.AsyncClient(
@@ -451,7 +532,7 @@ if __name__ == "__main__":
         # of keeping SSE open. Needed when fronted by Cloudflare Tunnel, which
         # handles the held-open SSE pattern poorly compared to CF proxy-to-origin.
         json_response = os.environ.get("MCP_JSON_RESPONSE", "").lower() in ("1", "true", "yes") or None
-        if _BEARER_TOKEN:
+        if _POLICIES or _INTROSPECTION_URL:
             app = gateway.http_app(json_response=json_response)
             app.add_middleware(BearerTokenMiddleware)
             import uvicorn
