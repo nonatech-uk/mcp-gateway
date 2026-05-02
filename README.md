@@ -27,7 +27,7 @@ Claude Code CLI                claude.ai web / Claude Desktop
               └── validates tokens:
                   1. static MCP_BEARER_TOKEN match → 200 (CLI fast-path)
                   2. else RFC 7662 introspection at
-                     https://kc.mees.st/realms/mcp/.../introspect
+                     https://kc.mees.st/realms/mees/.../introspect
                      → accept iff active + scope "mcp" + aud matches
                      this resource URL. 60s in-process cache.
 ```
@@ -35,7 +35,7 @@ Claude Code CLI                claude.ai web / Claude Desktop
 ## Auth
 
 - **Static bearer token** (`MCP_BEARER_TOKEN`) — the Claude Code CLI path, presented as `?token=…` or `Authorization: Bearer …`. Skips introspection, fast. Not suitable for claude.ai web.
-- **OAuth 2.1 via Keycloak** (`kc.mees.st/realms/mcp`) — claude.ai web / Desktop path. Clients discover the authorization server via the gateway's RFC 9728 `/.well-known/oauth-protected-resource` metadata, DCR a new client, then drive the standard auth-code + PKCE flow. Issued access tokens have `aud` bound to this gateway's URL via a hardcoded-audience scope mapper on the `mcp` scope in Keycloak.
+- **OAuth 2.1 via Keycloak** (`kc.mees.st/realms/mees`) — claude.ai web / Desktop path. Clients discover the authorization server via the gateway's RFC 9728 `/.well-known/oauth-protected-resource` metadata, DCR a new client, then drive the standard auth-code + PKCE flow. Issued access tokens have `aud` bound to this gateway's URL via a hardcoded-audience scope mapper on the `mcp` scope in Keycloak.
 - **401 responses** carry an absolute-URL `WWW-Authenticate` challenge:
   ```
   Bearer realm="MCP", resource_metadata="https://query.mees.st/.well-known/oauth-protected-resource"
@@ -63,7 +63,7 @@ Claude Code CLI                claude.ai web / Claude Desktop
 | `MCP_BEARER_TOKEN` | — | Static bearer token for the CLI fast-path. Presented as `?token=…` or `Authorization: Bearer …`. |
 | `MCP_GATEWAY_KEY` | — | Session unlock key for the optional `gateway_unlock` tool gate. |
 | `MCP_RESOURCE_URL` | — | Absolute URL of this resource (e.g. `https://query.mees.st/mcp`). Published in RFC 9728 metadata and in `WWW-Authenticate.resource_metadata`. |
-| `MCP_AUTHORIZATION_SERVER` | — | Issuer URL clients should discover (e.g. `https://kc.mees.st/realms/mcp`). |
+| `MCP_AUTHORIZATION_SERVER` | — | Issuer URL clients should discover (e.g. `https://kc.mees.st/realms/mees`). |
 | `MCP_INTROSPECTION_URL` | — | RFC 7662 introspection endpoint on the authorization server. |
 | `MCP_INTROSPECTION_CLIENT_ID` | — | Service-account client used to authenticate to the introspection endpoint. |
 | `MCP_INTROSPECTION_CLIENT_SECRET` | — | …matching secret. |
