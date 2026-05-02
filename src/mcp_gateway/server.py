@@ -17,9 +17,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from .access_log import init_pool as init_access_log_pool, log_event as log_access
 from .tokens import (
     TokenPolicy,
     UnlockProfile,
+    _dsn_from_env,
     clear_bearer_cache,
     ip_allowed,
     load_policies,
@@ -47,6 +49,11 @@ def _initial_load() -> tuple[list[TokenPolicy], list[UnlockProfile]]:
 
 
 _POLICIES, _UNLOCK_PROFILES = _initial_load()
+
+# Access-log pool — initialised once. log_access() is a no-op until init.
+_log_dsn = _dsn_from_env()
+if _log_dsn:
+    init_access_log_pool(_log_dsn)
 # session_id → matched policy. Populated by the HTTP middleware on every
 # authenticated request (Mcp-Session-Id header). Read by the FastMCP tool
 # middleware, which runs in the session-worker task where ContextVars set
@@ -155,7 +162,9 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                     "Token %r rejected — client IP %s not in allowlist",
                     policy.name, client_ip,
                 )
+                log_access("auth_fail_ip", actor_kind="static_bearer", actor_name=policy.name, client_ip=client_ip)
                 return self._unauthorized(origin, cors_ok)
+            log_access("auth_success", actor_kind="static_bearer", actor_name=policy.name, client_ip=client_ip)
             request.scope[_SCOPE_POLICY_KEY] = policy
             sid = request.headers.get("mcp-session-id", "")
             if sid:
@@ -188,6 +197,11 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                         "(sub=%r email=%r username=%r)",
                         sub, email, username,
                     )
+                    log_access(
+                        "auth_fail_token", actor_kind="oauth",
+                        client_ip=_client_ip(request),
+                        detail={"sub": sub, "email": email, "username": username},
+                    )
                     return self._unauthorized(origin, cors_ok)
                 client_ip = _client_ip(request)
                 if not ip_allowed(oauth_policy, client_ip):
@@ -195,7 +209,16 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                         "OAuth policy %r rejected — client IP %s not in allowlist",
                         oauth_policy.name, client_ip,
                     )
+                    log_access(
+                        "auth_fail_ip", actor_kind="oauth",
+                        actor_name=oauth_policy.name, client_ip=client_ip,
+                    )
                     return self._unauthorized(origin, cors_ok)
+                log_access(
+                    "auth_success", actor_kind="oauth",
+                    actor_name=oauth_policy.name, client_ip=client_ip,
+                    detail={"email": email, "username": username},
+                )
                 log.info(
                     "OAuth policy %r matched (email=%r ip=%s)",
                     oauth_policy.name, email, client_ip,
@@ -211,6 +234,8 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                 self._apply_cors(resp, origin, cors_ok)
                 return resp
 
+        # No static-bearer match and no successful OAuth introspection.
+        log_access("auth_fail_token", client_ip=_client_ip(request))
         return self._unauthorized(origin, cors_ok)
 
     async def _introspect_ok(self, token: str) -> tuple[bool, dict]:
@@ -427,6 +452,16 @@ async def tool_policy_middleware(
             log.warning(
                 "Token %r blocked from calling tool %r", policy.name, tool_name,
             )
+            try:
+                req = get_http_request()
+                ip = _client_ip(req) if req else None
+            except Exception:
+                ip = None
+            log_access(
+                "tool_deny",
+                actor_name=policy.name, client_ip=ip,
+                tool_name=tool_name, profile=profile.name if profile else None,
+            )
             scope_hint = ""
             if profile is not None:
                 scope_hint = (
@@ -626,11 +661,19 @@ def create_server() -> FastMCP:
                 session's tool scope to the intersection of the matched
                 policy and the profile's own tools_glob.
         """
+        # Pull client_ip if available so the access log can correlate.
+        try:
+            req = get_http_request()
+            ip = _client_ip(req) if req else None
+        except Exception:
+            ip = None
+
         # 1) DB-backed profiles take precedence.
         if _UNLOCK_PROFILES:
             p = match_unlock_profile(_UNLOCK_PROFILES, profile, key)
             if p is None:
                 log.warning("gateway_unlock failed — wrong profile/key (profile=%r)", profile)
+                log_access("unlock_fail", client_ip=ip, profile=profile)
                 raise ToolError(
                     f"AUTH: invalid key for unlock profile {profile!r}. "
                     "Check the profile name and key in mcp-admin.",
@@ -640,6 +683,7 @@ def create_server() -> FastMCP:
                 raise ToolError("AUTH: no session ID — gateway_unlock cannot bind a session.")
             _unlocked_sessions[sid] = p.name
             log.info("Session %s unlocked for profile %r", sid[:8], p.name)
+            log_access("unlock_success", client_ip=ip, profile=p.name)
             return f"Session unlocked for profile '{p.name}'. You may now use all tools permitted by your policy and this profile."
 
         # 2) Fallback: legacy single-global-key (YAML-only deployments).
@@ -663,6 +707,25 @@ def create_server() -> FastMCP:
             "status": "ok",
             "tools": len(tools),
         })
+
+    # mcp-admin reads this to populate its Tools page. Bearer-protected with
+    # the same MCP_RELOAD_TOKEN as /admin/reload.
+    @gw.custom_route("/admin/tools", methods=["GET"])
+    async def admin_tools(request: Request) -> JSONResponse:
+        if not _RELOAD_TOKEN:
+            return JSONResponse({"error": "admin endpoints disabled"}, status_code=503)
+        auth = request.headers.get("authorization", "")
+        if not auth.startswith("Bearer ") or auth[7:] != _RELOAD_TOKEN:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        tools = await gw.list_tools()
+        out = sorted([
+            {
+                "name": t.name,
+                "description": (t.description or "").splitlines()[0][:200] if t.description else "",
+            }
+            for t in tools
+        ], key=lambda d: d["name"])
+        return JSONResponse({"tools": out, "count": len(out)})
 
     # mcp-admin POSTs here after every mutation so policies refresh without
     # a full process restart. Bearer-protected with MCP_RELOAD_TOKEN (a
