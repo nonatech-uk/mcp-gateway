@@ -5,37 +5,56 @@ import os
 import ssl
 import time
 from collections.abc import Awaitable, Callable
-from contextvars import ContextVar
 
 import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.client.transports.http import StreamableHttpTransport
 from fastmcp.server import create_proxy
+from fastmcp.server.dependencies import get_http_request
 from fastmcp.server.middleware import MiddlewareContext
+from fastmcp.exceptions import ToolError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .tokens import (
     TokenPolicy,
+    UnlockProfile,
+    clear_bearer_cache,
     ip_allowed,
     load_policies,
+    match_oauth,
     match_token,
+    match_unlock_profile,
     tool_allowed,
 )
 
 log = logging.getLogger(__name__)
 
-_GATEWAY_KEY = os.environ.get("MCP_GATEWAY_KEY", "")
+_GATEWAY_KEY = os.environ.get("MCP_GATEWAY_KEY", "")  # legacy single-key fallback
 _TOKENS_FILE = os.environ.get("MCP_TOKENS_FILE", "/etc/mcp-gateway/tokens.yaml")
-_POLICIES: list[TokenPolicy] = (
-    load_policies(_TOKENS_FILE) if os.path.exists(_TOKENS_FILE) else []
-)
-# Ferries the matched policy from the Starlette HTTP middleware down to the
-# FastMCP tool middleware within the same request task.
-_current_policy: ContextVar[TokenPolicy | None] = ContextVar(
-    "_current_policy", default=None,
-)
+# Reload endpoint bearer; the admin app POSTs here after every mutation.
+_RELOAD_TOKEN = os.environ.get("MCP_RELOAD_TOKEN", "")
+
+
+def _initial_load() -> tuple[list[TokenPolicy], list[UnlockProfile]]:
+    yaml_path = _TOKENS_FILE if os.path.exists(_TOKENS_FILE) else None
+    try:
+        return load_policies(yaml_path)
+    except Exception:
+        log.exception("Initial policy load failed; starting with empty policy set")
+        return [], []
+
+
+_POLICIES, _UNLOCK_PROFILES = _initial_load()
+# session_id → matched policy. Populated by the HTTP middleware on every
+# authenticated request (Mcp-Session-Id header). Read by the FastMCP tool
+# middleware, which runs in the session-worker task where ContextVars set
+# in the HTTP request's task are not visible.
+_session_policy: dict[str, TokenPolicy] = {}
+# Scope key used to stash the policy on the Starlette request so FastMCP
+# code running in the same task (via get_http_request()) can recover it.
+_SCOPE_POLICY_KEY = "mcp_gateway_policy"
 _MCP_RESOURCE_URL = os.environ.get("MCP_RESOURCE_URL", "")
 _MCP_AUTHORIZATION_SERVER = os.environ.get("MCP_AUTHORIZATION_SERVER", "")
 # OAuth introspection (RFC 7662) for Keycloak-issued bearer tokens.
@@ -76,8 +95,9 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
     Returns 401 with WWW-Authenticate on failure so MCP clients discover the
     authorization server and start OAuth. Preserves CORS for browser clients."""
 
-    # token → (expires_at, accepted_bool)
-    _introspect_cache: dict[str, tuple[float, bool]] = {}
+    # token → (expires_at, accepted_bool, claims_dict).
+    # claims_dict carries sub/email/preferred_username for OAuth policy lookup.
+    _introspect_cache: dict[str, tuple[float, bool, dict]] = {}
     _cache_ttl = 60.0
 
     async def dispatch(self, request: Request, call_next):
@@ -99,8 +119,10 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                 headers["Vary"] = "Origin"
             return Response(status_code=204, headers=headers)
 
-        # /health + /.well-known/* are always public.
-        if p == "/health" or p.startswith("/.well-known/"):
+        # /health + /.well-known/* are always public. /admin/* is bearer-gated
+        # by the route handler itself (MCP_RELOAD_TOKEN), separate from the
+        # tokens.yaml/DB policy bearers handled below.
+        if p == "/health" or p.startswith("/.well-known/") or p.startswith("/admin/"):
             resp = await call_next(request)
             self._apply_cors(resp, origin, cors_ok)
             return resp
@@ -119,7 +141,12 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             return self._unauthorized(origin, cors_ok)
 
         # Static token path. Match against configured policies, enforce the
-        # policy's IP allowlist, then hand the policy to downstream middleware.
+        # policy's IP allowlist, then expose the policy to downstream
+        # middleware via two routes: request.scope (recoverable from the
+        # same task via get_http_request()) and a session_id → policy map
+        # keyed on Mcp-Session-Id, because FastMCP dispatches tool calls
+        # from a pre-spawned session worker task whose ContextVar snapshot
+        # predates our HTTP middleware.
         policy = match_token(_POLICIES, token) if _POLICIES else None
         if policy is not None:
             client_ip = _client_ip(request)
@@ -129,27 +156,68 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                     policy.name, client_ip,
                 )
                 return self._unauthorized(origin, cors_ok)
-            reset = _current_policy.set(policy)
-            try:
-                resp = await call_next(request)
-            finally:
-                _current_policy.reset(reset)
+            request.scope[_SCOPE_POLICY_KEY] = policy
+            sid = request.headers.get("mcp-session-id", "")
+            if sid:
+                _session_policy[sid] = policy
+            resp = await call_next(request)
+            # On initialize the server assigns a session_id in the response;
+            # pick it up so subsequent messages on that session can find the
+            # policy even if the client's next request race-races auth.
+            new_sid = resp.headers.get("mcp-session-id", "")
+            if new_sid and new_sid not in _session_policy:
+                _session_policy[new_sid] = policy
             self._apply_cors(resp, origin, cors_ok)
             return resp
 
-        # OAuth bearer path.
-        if _INTROSPECTION_URL and await self._introspect_ok(token):
-            resp = await call_next(request)
-            self._apply_cors(resp, origin, cors_ok)
-            return resp
+        # OAuth bearer path. A valid Keycloak token must additionally match
+        # an explicit policy in tokens.yaml; without one we deny, so adding
+        # a user to the realm is not by itself enough to grant tool access.
+        if _INTROSPECTION_URL:
+            ok, claims = await self._introspect_ok(token)
+            if ok:
+                sub = claims.get("sub", "")
+                email = claims.get("email", "")
+                username = claims.get("preferred_username", "")
+                oauth_policy = match_oauth(
+                    _POLICIES, sub=sub, email=email, username=username,
+                )
+                if oauth_policy is None:
+                    log.warning(
+                        "OAuth token rejected — no policy matches "
+                        "(sub=%r email=%r username=%r)",
+                        sub, email, username,
+                    )
+                    return self._unauthorized(origin, cors_ok)
+                client_ip = _client_ip(request)
+                if not ip_allowed(oauth_policy, client_ip):
+                    log.warning(
+                        "OAuth policy %r rejected — client IP %s not in allowlist",
+                        oauth_policy.name, client_ip,
+                    )
+                    return self._unauthorized(origin, cors_ok)
+                log.info(
+                    "OAuth policy %r matched (email=%r ip=%s)",
+                    oauth_policy.name, email, client_ip,
+                )
+                request.scope[_SCOPE_POLICY_KEY] = oauth_policy
+                sid = request.headers.get("mcp-session-id", "")
+                if sid:
+                    _session_policy[sid] = oauth_policy
+                resp = await call_next(request)
+                new_sid = resp.headers.get("mcp-session-id", "")
+                if new_sid and new_sid not in _session_policy:
+                    _session_policy[new_sid] = oauth_policy
+                self._apply_cors(resp, origin, cors_ok)
+                return resp
 
         return self._unauthorized(origin, cors_ok)
 
-    async def _introspect_ok(self, token: str) -> bool:
+    async def _introspect_ok(self, token: str) -> tuple[bool, dict]:
         now = time.monotonic()
         cached = self._introspect_cache.get(token)
         if cached and cached[0] > now:
-            return cached[1]
+            return cached[1], cached[2]
         try:
             async with httpx.AsyncClient(timeout=5) as c:
                 r = await c.post(
@@ -162,35 +230,40 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                 body = r.json()
         except Exception as e:
             log.warning("Introspection failed: %s", e)
-            self._introspect_cache[token] = (now + self._cache_ttl, False)
-            return False
+            self._introspect_cache[token] = (now + self._cache_ttl, False, {})
+            return False, {}
 
         if not body.get("active"):
-            self._introspect_cache[token] = (now + self._cache_ttl, False)
-            return False
+            self._introspect_cache[token] = (now + self._cache_ttl, False, {})
+            return False, {}
         # Required scope (space-separated string in RFC 7662).
         if _INTROSPECTION_REQUIRED_SCOPE:
             scopes = (body.get("scope") or "").split()
             if _INTROSPECTION_REQUIRED_SCOPE not in scopes:
                 log.info("Token rejected: missing required scope %r", _INTROSPECTION_REQUIRED_SCOPE)
-                self._introspect_cache[token] = (now + self._cache_ttl, False)
-                return False
+                self._introspect_cache[token] = (now + self._cache_ttl, False, {})
+                return False, {}
         # Required audience (string or list per RFC 7662).
         if _INTROSPECTION_REQUIRED_AUD:
             aud = body.get("aud")
             aud_list = aud if isinstance(aud, list) else ([aud] if aud else [])
             if _INTROSPECTION_REQUIRED_AUD not in aud_list:
                 log.info("Token rejected: aud %r does not include %r", aud, _INTROSPECTION_REQUIRED_AUD)
-                self._introspect_cache[token] = (now + self._cache_ttl, False)
-                return False
+                self._introspect_cache[token] = (now + self._cache_ttl, False, {})
+                return False, {}
 
-        self._introspect_cache[token] = (now + self._cache_ttl, True)
+        claims = {
+            "sub": body.get("sub", ""),
+            "email": body.get("email", ""),
+            "preferred_username": body.get("preferred_username", ""),
+        }
+        self._introspect_cache[token] = (now + self._cache_ttl, True, claims)
         # Opportunistic cache trim.
         if len(self._introspect_cache) > 1024:
-            for k, (exp, _) in list(self._introspect_cache.items()):
+            for k, (exp, *_rest) in list(self._introspect_cache.items()):
                 if exp <= now:
                     self._introspect_cache.pop(k, None)
-        return True
+        return True, claims
 
     def _unauthorized(self, origin: str, cors_ok: bool) -> Response:
         # Minimal WWW-Authenticate — Anthropic's MCP client expects
@@ -234,7 +307,12 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
-_unlocked_sessions: set[str] = set()
+# session_id → unlock-profile name. Populated by gateway_unlock; consulted
+# by gateway_key_middleware (gate) and tool_policy_middleware (intersection).
+# The legacy "default" profile carries `tools_glob: ['*']` so callers that
+# still call gateway_unlock(key=...) without specifying a profile see no
+# narrowing — same observable behaviour as the previous global-key model.
+_unlocked_sessions: dict[str, str] = {}
 
 # Backend MCP servers configured via env: MCP_BACKENDS=name=url,name=url,...
 # e.g. MCP_BACKENDS=tautulli=http://mcp-tautulli:8080/mcp,paperless=http://mcp-paperless:8080/mcp
@@ -270,9 +348,55 @@ async def gateway_key_middleware(
     sid = ctx.session_id if ctx else None
     if not sid or sid not in _unlocked_sessions:
         log.warning("Blocked %s — session %s not unlocked", tool_name, (sid or "?")[:8])
-        raise ValueError("Session not unlocked. Call gateway_unlock with the correct key first.")
+        raise ToolError(
+            "AUTH: this session is locked. Call gateway_unlock(profile=…, key=…) "
+            "before calling other tools.",
+        )
 
     return await call_next(context)
+
+
+def _profile_for(context: MiddlewareContext) -> UnlockProfile | None:
+    """The unlock profile bound to this session, if any."""
+    ctx = context.fastmcp_context
+    sid = ctx.session_id if ctx else None
+    if not sid:
+        return None
+    name = _unlocked_sessions.get(sid)
+    if not name:
+        return None
+    for p in _UNLOCK_PROFILES:
+        if p.name == name:
+            return p
+    return None
+
+
+def _policy_for(context: MiddlewareContext) -> TokenPolicy | None:
+    """Recover the policy bound to this request.
+
+    Two sources, in order:
+      1. The per-session map populated by the HTTP middleware, keyed on the
+         Mcp-Session-Id header. Works for every message after initialize.
+      2. request.scope[_SCOPE_POLICY_KEY], for code paths (e.g. the initialize
+         request itself) where FastMCP is still running in the original HTTP
+         request task and get_http_request() returns the live Starlette request.
+    """
+    sid = None
+    ctx = context.fastmcp_context
+    if ctx is not None:
+        try:
+            sid = ctx.session_id
+        except Exception:
+            sid = None
+    if sid:
+        pol = _session_policy.get(sid)
+        if pol is not None:
+            return pol
+    try:
+        req = get_http_request()
+    except Exception:
+        return None
+    return req.scope.get(_SCOPE_POLICY_KEY)
 
 
 async def tool_policy_middleware(
@@ -281,26 +405,38 @@ async def tool_policy_middleware(
 ):
     """FastMCP middleware: enforce per-token tool allowlist.
 
-    When the request was authenticated via a static-token policy (stashed in
-    _current_policy by the HTTP-level middleware), filter tools/list and gate
-    tools/call against the policy's glob patterns. OAuth and local no-auth
-    traffic leave _current_policy unset and pass through unchanged.
+    When the request was authenticated via a static-token or OAuth policy,
+    filter tools/list and gate tools/call against the policy's glob patterns.
+    Local no-auth traffic (mcp-local) leaves no policy bound and passes
+    through unchanged. Authenticated callers always have a policy because
+    the HTTP middleware denies OAuth tokens without a matching policy.
     """
-    policy = _current_policy.get()
+    policy = _policy_for(context)
     if policy is None:
         return await call_next(context)
 
+    profile = _profile_for(context)
+
     if context.method == "tools/list":
         tools = await call_next(context)
-        return [t for t in tools if tool_allowed(policy, t.name)]
+        return [t for t in tools if tool_allowed(policy, t.name, profile)]
 
     if context.method == "tools/call":
         tool_name = getattr(context.message, "name", "") or ""
-        if not tool_allowed(policy, tool_name):
+        if not tool_allowed(policy, tool_name, profile):
             log.warning(
                 "Token %r blocked from calling tool %r", policy.name, tool_name,
             )
-            raise ValueError(f"Tool {tool_name!r} is not permitted for this token.")
+            scope_hint = ""
+            if profile is not None:
+                scope_hint = (
+                    f" (session unlocked with profile {profile.name!r}; "
+                    f"tools must satisfy both the policy and the profile)"
+                )
+            raise ToolError(
+                f"AUTH: tool {tool_name!r} is not permitted for token "
+                f"{policy.name!r}{scope_hint}.",
+            )
 
     return await call_next(context)
 
@@ -313,10 +449,15 @@ def create_server() -> FastMCP:
     if _POLICIES:
         log.warning("Bearer token middleware enabled (%d policies)", len(_POLICIES))
 
-    # Register gateway key middleware if key is configured
-    if _GATEWAY_KEY:
+    # Register gateway-key middleware whenever any unlock mechanism is
+    # configured (DB-backed profiles take precedence; legacy single key is
+    # the fallback for boot-without-DB scenarios).
+    if _UNLOCK_PROFILES or _GATEWAY_KEY:
         gw.add_middleware(gateway_key_middleware)
-        log.warning("Gateway key middleware enabled")
+        log.warning(
+            "Gateway key middleware enabled (%d profile(s)%s)",
+            len(_UNLOCK_PROFILES), ", legacy key" if _GATEWAY_KEY else "",
+        )
 
     # Per-token tool filtering (only active when a policy matched at HTTP layer)
     if _POLICIES:
@@ -470,24 +611,50 @@ def create_server() -> FastMCP:
             """
             return await _nas_call("/api/tools/suggestions_recent", {"count": count, "host": host})
 
-    # Session unlock tool — required before any other tool call when MCP_GATEWAY_KEY is set
-    if _GATEWAY_KEY:
-        @gw.tool(name="gateway_unlock")
-        async def gateway_unlock(key: str, ctx: Context) -> str:
-            """Unlock this session to allow tool calls. Must be called before using any other tool.
+    # Session unlock tool — gates tool calls behind a profile-bound key.
+    # Backwards-compatible: callers that pass only `key` get profile="default".
+    # The "default" profile is seeded with `tools_glob: ['*']` so legacy
+    # behaviour is unchanged. Supplying a different profile narrows the session
+    # to the intersection of the matched policy's tools and the profile's tools.
+    @gw.tool(name="gateway_unlock")
+    async def gateway_unlock(key: str, ctx: Context, profile: str = "default") -> str:
+        """Unlock this session to allow tool calls. Must be called before using any other tool.
 
-            Args:
-                key: The gateway access key.
-            """
-            if key != _GATEWAY_KEY:
-                log.warning("gateway_unlock failed — wrong key")
-                return "ERROR: Invalid key."
-            sid = ctx.session_id
+        Args:
+            key: The unlock key for the chosen profile.
+            profile: Profile name (default 'default'). Profiles narrow the
+                session's tool scope to the intersection of the matched
+                policy and the profile's own tools_glob.
+        """
+        # 1) DB-backed profiles take precedence.
+        if _UNLOCK_PROFILES:
+            p = match_unlock_profile(_UNLOCK_PROFILES, profile, key)
+            if p is None:
+                log.warning("gateway_unlock failed — wrong profile/key (profile=%r)", profile)
+                raise ToolError(
+                    f"AUTH: invalid key for unlock profile {profile!r}. "
+                    "Check the profile name and key in mcp-admin.",
+                )
+            sid = ctx.session_id if ctx else None
             if not sid:
-                return "ERROR: No session ID found."
-            _unlocked_sessions.add(sid)
-            log.info("Session %s unlocked", sid[:8])
+                raise ToolError("AUTH: no session ID — gateway_unlock cannot bind a session.")
+            _unlocked_sessions[sid] = p.name
+            log.info("Session %s unlocked for profile %r", sid[:8], p.name)
+            return f"Session unlocked for profile '{p.name}'. You may now use all tools permitted by your policy and this profile."
+
+        # 2) Fallback: legacy single-global-key (YAML-only deployments).
+        if _GATEWAY_KEY:
+            if key != _GATEWAY_KEY:
+                log.warning("gateway_unlock failed — wrong key (legacy mode)")
+                raise ToolError("AUTH: invalid gateway key.")
+            sid = ctx.session_id if ctx else None
+            if not sid:
+                raise ToolError("AUTH: no session ID — gateway_unlock cannot bind a session.")
+            _unlocked_sessions[sid] = "default"
+            log.info("Session %s unlocked (legacy global key)", sid[:8])
             return "Session unlocked. You may now use all tools."
+
+        raise ToolError("AUTH: no unlock mechanism configured on this gateway.")
 
     @gw.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> JSONResponse:
@@ -495,6 +662,35 @@ def create_server() -> FastMCP:
         return JSONResponse({
             "status": "ok",
             "tools": len(tools),
+        })
+
+    # mcp-admin POSTs here after every mutation so policies refresh without
+    # a full process restart. Bearer-protected with MCP_RELOAD_TOKEN (a
+    # podman secret shared between gateway and admin app).
+    @gw.custom_route("/admin/reload", methods=["POST"])
+    async def admin_reload(request: Request) -> JSONResponse:
+        if not _RELOAD_TOKEN:
+            return JSONResponse({"error": "reload disabled (MCP_RELOAD_TOKEN unset)"}, status_code=503)
+        auth = request.headers.get("authorization", "")
+        if not auth.startswith("Bearer ") or auth[7:] != _RELOAD_TOKEN:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        global _POLICIES, _UNLOCK_PROFILES
+        try:
+            new_policies, new_profiles = _initial_load()
+        except Exception as e:
+            log.exception("Reload failed")
+            return JSONResponse({"error": str(e)}, status_code=500)
+        _POLICIES = new_policies
+        _UNLOCK_PROFILES = new_profiles
+        clear_bearer_cache()
+        log.warning(
+            "Reloaded policy via /admin/reload: %d policies, %d profiles",
+            len(_POLICIES), len(_UNLOCK_PROFILES),
+        )
+        return JSONResponse({
+            "ok": True,
+            "policies": len(_POLICIES),
+            "unlock_profiles": len(_UNLOCK_PROFILES),
         })
 
     # RFC 9728 protected-resource metadata. Tells MCP clients which authorization
