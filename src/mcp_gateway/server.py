@@ -575,12 +575,12 @@ def create_server() -> FastMCP:
             except Exception as e:
                 return f"Error calling NAS host-tools: {e}"
 
-        @gw.tool(name="host_list")
+        @gw.tool(name="host_tools_list")
         async def host_list() -> str:
             """List all available hosts that can be targeted with host_exec."""
             return await _nas_call("/api/tools/list_hosts")
 
-        @gw.tool(name="host_commands")
+        @gw.tool(name="host_tools_commands")
         async def host_commands(host: str | None = None) -> str:
             """List all available commands on a host.
 
@@ -589,7 +589,7 @@ def create_server() -> FastMCP:
             """
             return await _nas_call("/api/tools/list_commands", {"host": host})
 
-        @gw.tool(name="host_exec")
+        @gw.tool(name="host_tools_exec")
         async def host_exec(
             name: str, params: dict[str, str | int] | None = None, host: str | None = None,
         ) -> str:
@@ -604,7 +604,7 @@ def create_server() -> FastMCP:
                 "name": name, "params": params or {}, "host": host,
             })
 
-        @gw.tool(name="host_suggest")
+        @gw.tool(name="host_tools_suggest")
         async def host_suggest(
             command: str,
             reason: str,
@@ -627,7 +627,7 @@ def create_server() -> FastMCP:
                 "command": command, "reason": reason, "params": params, "host": host,
             })
 
-        @gw.tool(name="suggestions_pending")
+        @gw.tool(name="host_tools_suggestions_pending")
         async def suggestions_pending(host: str | None = None) -> str:
             """Show pending command suggestions awaiting approval. Check this before suggesting to avoid duplicates.
 
@@ -636,7 +636,7 @@ def create_server() -> FastMCP:
             """
             return await _nas_call("/api/tools/suggestions_pending", {"host": host})
 
-        @gw.tool(name="suggestions_recent")
+        @gw.tool(name="host_tools_suggestions_recent")
         async def suggestions_recent(count: int = 10, host: str | None = None) -> str:
             """Show recently approved/rejected suggestions. Use to confirm a suggestion landed correctly.
 
