@@ -22,6 +22,7 @@ import hmac
 import ipaddress
 import logging
 import os
+import socket
 from dataclasses import dataclass, field
 
 import psycopg2
@@ -47,6 +48,9 @@ class TokenPolicy:
     oauth_sub: list[str] = field(default_factory=list)
     oauth_email: list[str] = field(default_factory=list)
     oauth_username: list[str] = field(default_factory=list)
+    # Per-host scope for host-aware tools (host_tools_*, logs_*).
+    # Empty list = deny; ['*'] = allow any host; otherwise the exact set.
+    host_allowlist: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -54,6 +58,7 @@ class UnlockProfile:
     name: str
     key_hash: str
     tool_patterns: list[str]
+    host_allowlist: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -118,22 +123,23 @@ def _load_from_db(dsn: str) -> tuple[list[TokenPolicy], list[UnlockProfile]]:
     with psycopg2.connect(dsn + " connect_timeout=5") as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT name, token_hash, tools_glob, ip_allowlist "
+            "SELECT name, token_hash, tools_glob, ip_allowlist, host_allowlist "
             "  FROM static_tokens WHERE revoked_at IS NULL"
         )
-        for name, token_hash, tools, ips in cur.fetchall():
+        for name, token_hash, tools, ips, hosts in cur.fetchall():
             policies.append(TokenPolicy(
                 name=name,
                 token_hash=token_hash,
                 tool_patterns=list(tools or []),
                 ip_networks=[ipaddress.ip_network(str(c), strict=False) for c in (ips or [])],
+                host_allowlist=list(hosts or []),
             ))
 
         cur.execute(
-            "SELECT name, oauth_sub, oauth_email, oauth_username, tools_glob, ip_allowlist "
+            "SELECT name, oauth_sub, oauth_email, oauth_username, tools_glob, ip_allowlist, host_allowlist "
             "  FROM oauth_policies WHERE revoked_at IS NULL"
         )
-        for name, subs, emails, usernames, tools, ips in cur.fetchall():
+        for name, subs, emails, usernames, tools, ips, hosts in cur.fetchall():
             policies.append(TokenPolicy(
                 name=name,
                 tool_patterns=list(tools or []),
@@ -141,17 +147,19 @@ def _load_from_db(dsn: str) -> tuple[list[TokenPolicy], list[UnlockProfile]]:
                 oauth_sub=list(subs or []),
                 oauth_email=list(emails or []),
                 oauth_username=list(usernames or []),
+                host_allowlist=list(hosts or []),
             ))
 
         cur.execute(
-            "SELECT name, key_hash, tools_glob "
+            "SELECT name, key_hash, tools_glob, host_allowlist "
             "  FROM unlock_profiles WHERE revoked_at IS NULL"
         )
-        for name, key_hash, tools in cur.fetchall():
+        for name, key_hash, tools, hosts in cur.fetchall():
             profiles.append(UnlockProfile(
                 name=name,
                 key_hash=key_hash,
                 tool_patterns=list(tools or []),
+                host_allowlist=list(hosts or []),
             ))
 
     log.warning("Loaded %d policies and %d unlock profiles from DB", len(policies), len(profiles))
@@ -176,6 +184,10 @@ def _load_from_yaml(path: str) -> list[TokenPolicy]:
 
         ip_entries = entry.get("ip_allowlist") or []
         ip_networks = [ipaddress.ip_network(s, strict=False) for s in ip_entries]
+
+        host_allowlist = entry.get("host_allowlist") or []
+        if not isinstance(host_allowlist, list) or not all(isinstance(h, str) for h in host_allowlist):
+            raise ValueError(f"{path}: policy {name!r} 'host_allowlist' must be a list of strings")
 
         def _listify(key: str) -> list[str]:
             v = entry.get(key)
@@ -210,6 +222,7 @@ def _load_from_yaml(path: str) -> list[TokenPolicy]:
             oauth_sub=oauth_sub,
             oauth_email=oauth_email,
             oauth_username=oauth_username,
+            host_allowlist=list(host_allowlist),
         ))
 
     log.warning("Loaded %d policies from %s (YAML fallback)", len(policies), path)
@@ -317,3 +330,45 @@ def ip_allowed(policy: TokenPolicy, client_ip: str) -> bool:
     except ValueError:
         return False
     return any(addr in net for net in policy.ip_networks)
+
+
+def _host_match(allow: list[str], target: str) -> bool:
+    """Empty list = deny. '*' = allow any. Otherwise exact (case-sensitive) match."""
+    if not allow:
+        return False
+    if "*" in allow:
+        return True
+    return target in allow
+
+
+def host_allowed(
+    policy: TokenPolicy,
+    profile: UnlockProfile | None,
+    host: str | None,
+) -> bool:
+    """Whether this policy (intersected with profile, if any) grants `host`.
+
+    A None / empty `host` is resolved to MCP_DEFAULT_HOST (or
+    socket.gethostname() as a last resort) so the check has a concrete
+    target — matches what the host-tools backend does when it gets a
+    bare call.
+    """
+    target = host or os.environ.get("MCP_DEFAULT_HOST") or socket.gethostname()
+    if not _host_match(policy.host_allowlist, target):
+        return False
+    if profile is not None and not _host_match(profile.host_allowlist, target):
+        return False
+    return True
+
+
+def filter_hosts(
+    policy: TokenPolicy,
+    profile: UnlockProfile | None,
+    hosts: list[str],
+) -> list[str]:
+    """Filter a list of hostnames down to those the policy + profile permit.
+
+    Used for response-filtered tools (host_tools_list, logs_hosts) where the
+    caller didn't pass a host arg but we need to scrub the response.
+    """
+    return [h for h in hosts if host_allowed(policy, profile, h)]

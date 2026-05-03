@@ -23,6 +23,8 @@ from .tokens import (
     UnlockProfile,
     _dsn_from_env,
     clear_bearer_cache,
+    filter_hosts,
+    host_allowed,
     ip_allowed,
     load_policies,
     match_oauth,
@@ -75,6 +77,24 @@ _CORS_ALLOWED_ORIGINS = {
         "MCP_CORS_ALLOWED_ORIGINS",
         "https://claude.ai,https://www.claude.ai",
     ).split(",") if o.strip()
+}
+
+# Tools that take a `host` arg (or return a list of hosts) and must be gated
+# against TokenPolicy.host_allowlist. "input" mode = check args.host before
+# the call; "response" mode = filter the returned host list against the
+# allowlist. The middleware uses this registry; per-tool wrappers re-check
+# as defense in depth.
+HOST_AWARE_TOOLS: dict[str, str] = {
+    "host_tools_commands":            "input",
+    "host_tools_exec":                "input",
+    "host_tools_suggest":             "input",
+    "host_tools_suggestions_pending": "input",
+    "host_tools_suggestions_recent":  "input",
+    "logs_search":                    "input",
+    "logs_services":                  "input",
+    "logs_volume":                    "input",
+    "host_tools_list":                "response",
+    "logs_hosts":                     "response",
 }
 
 
@@ -424,6 +444,118 @@ def _policy_for(context: MiddlewareContext) -> TokenPolicy | None:
     return req.scope.get(_SCOPE_POLICY_KEY)
 
 
+def _policy_for_ctx(ctx: Context | None) -> TokenPolicy | None:
+    """Same as _policy_for but takes a FastMCP Context directly (for use
+    inside @gw.tool wrappers, where the FastMCP middleware context type
+    isn't available)."""
+    sid = None
+    if ctx is not None:
+        try:
+            sid = ctx.session_id
+        except Exception:
+            sid = None
+    if sid:
+        pol = _session_policy.get(sid)
+        if pol is not None:
+            return pol
+    try:
+        req = get_http_request()
+    except Exception:
+        return None
+    return req.scope.get(_SCOPE_POLICY_KEY)
+
+
+def _profile_for_ctx(ctx: Context | None) -> UnlockProfile | None:
+    """FastMCP-Context variant of _profile_for."""
+    sid = None
+    if ctx is not None:
+        try:
+            sid = ctx.session_id
+        except Exception:
+            sid = None
+    if not sid:
+        return None
+    name = _unlocked_sessions.get(sid)
+    if not name:
+        return None
+    for p in _UNLOCK_PROFILES:
+        if p.name == name:
+            return p
+    return None
+
+
+# Patterns used to extract hostnames from the human-formatted text returned
+# by host-aware tools when post-filtering responses. The mcp-loki and
+# mcp-host-tools backends emit these formats:
+#   - logs_hosts:        "  - <hostname>"            (one per line)
+#   - host_tools_list:   "  <hostname> (local)"      or "  <hostname> (10.x.x.x)"
+import re as _re
+_LOGS_HOSTS_RE = _re.compile(r"^(\s*-\s+)([A-Za-z0-9][A-Za-z0-9._-]+)\s*$")
+_HOST_TOOLS_LIST_RE = _re.compile(r"^(\s+)([A-Za-z0-9][A-Za-z0-9._-]+)(\s+\([^)]+\)\s*)$")
+
+
+def _filter_text_hosts(
+    text: str,
+    tool_name: str,
+    policy: TokenPolicy,
+    profile: UnlockProfile | None,
+) -> str:
+    """Rewrite a host-listing text response to drop disallowed hosts.
+
+    Lines that don't match the host-line regex pass through verbatim
+    (headers, blank lines, descriptions). Lines that do match are kept
+    only if host_allowed() returns True for the hostname.
+    """
+    if tool_name == "logs_hosts":
+        regex = _LOGS_HOSTS_RE
+    elif tool_name == "host_tools_list":
+        regex = _HOST_TOOLS_LIST_RE
+    else:
+        return text
+
+    out_lines: list[str] = []
+    skipping_block = False  # for host_tools_list: also drop the indented description block of a dropped host
+    for line in text.splitlines():
+        m = regex.match(line)
+        if m:
+            host = m.group(2)
+            if host_allowed(policy, profile, host):
+                out_lines.append(line)
+                skipping_block = False
+            else:
+                skipping_block = True
+            continue
+        # Non-matching line — keep it unless we're inside a dropped host's body.
+        # For host_tools_list, the body is "    description" / "    Paths: ..."
+        # (4+ leading spaces). Reset the skip flag on any non-indented line.
+        if skipping_block and line.startswith("    "):
+            continue
+        skipping_block = False
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def _post_filter_response(
+    tool_name: str,
+    result,
+    policy: TokenPolicy,
+    profile: UnlockProfile | None,
+):
+    """Apply response-mode filtering. Mutates TextContent blocks in place
+    and returns the (possibly-modified) result. Unknown shapes pass through."""
+    try:
+        # FastMCP middleware result for tools/call is typically a list of
+        # content blocks (TextContent, ImageContent, ...). We only filter
+        # text blocks; everything else is left alone.
+        for block in result:
+            text = getattr(block, "text", None)
+            if isinstance(text, str) and text:
+                block.text = _filter_text_hosts(text, tool_name, policy, profile)
+    except Exception:
+        log.exception("Response-mode host filter failed for %s — returning raw", tool_name)
+    return result
+
+
 async def tool_policy_middleware(
     context: MiddlewareContext,
     call_next: Callable[[MiddlewareContext], Awaitable],
@@ -472,6 +604,34 @@ async def tool_policy_middleware(
                 f"AUTH: tool {tool_name!r} is not permitted for token "
                 f"{policy.name!r}{scope_hint}.",
             )
+
+        # Per-host scoping. For "input" mode, deny outright if the requested
+        # host is outside the allowlist. For "response" mode, defer until
+        # after call_next so we can post-filter the returned host list.
+        host_mode = HOST_AWARE_TOOLS.get(tool_name)
+        if host_mode == "input":
+            args = getattr(context.message, "arguments", None) or {}
+            host = args.get("host")
+            if not host_allowed(policy, profile, host):
+                try:
+                    req = get_http_request()
+                    ip = _client_ip(req) if req else None
+                except Exception:
+                    ip = None
+                log_access(
+                    "host_deny",
+                    actor_name=policy.name, client_ip=ip,
+                    tool_name=tool_name, profile=profile.name if profile else None,
+                    detail=str(host or "<default>"),
+                )
+                raise ToolError(
+                    f"AUTH: token {policy.name!r} is not permitted to target host "
+                    f"{host or '<default>'!r} via {tool_name!r}.",
+                )
+
+        if host_mode == "response":
+            result = await call_next(context)
+            return _post_filter_response(tool_name, result, policy, profile)
 
     return await call_next(context)
 
@@ -575,23 +735,52 @@ def create_server() -> FastMCP:
             except Exception as e:
                 return f"Error calling NAS host-tools: {e}"
 
+        def _host_deny_msg(tool_name: str, host: str | None) -> str:
+            return (
+                f"AUTH: not permitted to target host {host or '<default>'!r} "
+                f"via {tool_name!r}."
+            )
+
+        def _check_host(ctx: Context | None, tool_name: str, host: str | None) -> str | None:
+            """Defense in depth: re-check host against the policy bound to the
+            session. Returns an error string if denied, None if allowed.
+            (Middleware also enforces this — two layers, identical answer.)"""
+            policy = _policy_for_ctx(ctx)
+            if policy is None:
+                return None  # no auth bound (mcp-local) — middleware already gated
+            profile = _profile_for_ctx(ctx)
+            if not host_allowed(policy, profile, host):
+                return _host_deny_msg(tool_name, host)
+            return None
+
         @gw.tool(name="host_tools_list")
-        async def host_list() -> str:
+        async def host_list(ctx: Context) -> str:
             """List all available hosts that can be targeted with host_exec."""
-            return await _nas_call("/api/tools/list_hosts")
+            raw = await _nas_call("/api/tools/list_hosts")
+            policy = _policy_for_ctx(ctx)
+            if policy is None:
+                return raw
+            profile = _profile_for_ctx(ctx)
+            return _filter_text_hosts(raw, "host_tools_list", policy, profile)
 
         @gw.tool(name="host_tools_commands")
-        async def host_commands(host: str | None = None) -> str:
+        async def host_commands(ctx: Context, host: str | None = None) -> str:
             """List all available commands on a host.
 
             Args:
                 host: Target host name from host_list. Defaults to the local host.
             """
+            denied = _check_host(ctx, "host_tools_commands", host)
+            if denied:
+                return denied
             return await _nas_call("/api/tools/list_commands", {"host": host})
 
         @gw.tool(name="host_tools_exec")
         async def host_exec(
-            name: str, params: dict[str, str | int] | None = None, host: str | None = None,
+            ctx: Context,
+            name: str,
+            params: dict[str, str | int] | None = None,
+            host: str | None = None,
         ) -> str:
             """Run an allowed command on a host.
 
@@ -600,12 +789,16 @@ def create_server() -> FastMCP:
                 params: Parameters for the command (e.g. {"service": "traefik"})
                 host: Target host name from host_list. Defaults to the local host.
             """
+            denied = _check_host(ctx, "host_tools_exec", host)
+            if denied:
+                return denied
             return await _nas_call("/api/tools/run_command", {
                 "name": name, "params": params or {}, "host": host,
             })
 
         @gw.tool(name="host_tools_suggest")
         async def host_suggest(
+            ctx: Context,
             command: str,
             reason: str,
             suggested_name: str | None = None,
@@ -621,6 +814,9 @@ def create_server() -> FastMCP:
                 params: Optional parameter definitions for templatizing
                 host: Which host this command is for. Defaults to the local host.
             """
+            denied = _check_host(ctx, "host_tools_suggest", host)
+            if denied:
+                return denied
             if suggested_name:
                 reason = f"Suggested name: {suggested_name} | {reason}"
             return await _nas_call("/api/tools/suggest_command", {
@@ -628,22 +824,30 @@ def create_server() -> FastMCP:
             })
 
         @gw.tool(name="host_tools_suggestions_pending")
-        async def suggestions_pending(host: str | None = None) -> str:
+        async def suggestions_pending(ctx: Context, host: str | None = None) -> str:
             """Show pending command suggestions awaiting approval. Check this before suggesting to avoid duplicates.
 
             Args:
                 host: Filter by host name. Omit to see all hosts.
             """
+            denied = _check_host(ctx, "host_tools_suggestions_pending", host)
+            if denied:
+                return denied
             return await _nas_call("/api/tools/suggestions_pending", {"host": host})
 
         @gw.tool(name="host_tools_suggestions_recent")
-        async def suggestions_recent(count: int = 10, host: str | None = None) -> str:
+        async def suggestions_recent(
+            ctx: Context, count: int = 10, host: str | None = None,
+        ) -> str:
             """Show recently approved/rejected suggestions. Use to confirm a suggestion landed correctly.
 
             Args:
                 count: Number of recent items to show (default 10)
                 host: Filter by host name. Omit to see all hosts.
             """
+            denied = _check_host(ctx, "host_tools_suggestions_recent", host)
+            if denied:
+                return denied
             return await _nas_call("/api/tools/suggestions_recent", {"count": count, "host": host})
 
     # Session unlock tool — gates tool calls behind a profile-bound key.
